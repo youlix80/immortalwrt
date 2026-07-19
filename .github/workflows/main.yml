@@ -1,0 +1,101 @@
+name: Build ImmortalWrt
+
+# 触发规则：推送代码、手动运行、每日定时编译
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * *"
+
+env:
+  TZ: Asia/Shanghai
+  IMMORTAL_REPO: https://github.com/immortalwrt/immortalwrt
+  IMMORTAL_BRANCH: master
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      # 拉取你仓库的配置文件
+      - name: Checkout config
+        uses: actions/checkout@v4
+
+      # 安装编译依赖
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses-dev libssl-dev python3-distutils rsync unzip zlib-dev file wget curl
+
+      # 扩容16G Swap，解决编译内存不足崩溃
+      - name: Add swap memory
+        run: |
+          sudo swapoff -a
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      # 缓存dl下载包，下次编译大幅提速
+      - name: Cache download files
+        uses: actions/cache@v3
+        with:
+          path: immortalwrt/dl
+          key: dl-cache-${{ github.run_id }}
+
+      # 克隆 ImmortalWrt 源码
+      - name: Clone ImmortalWrt source
+        run: |
+          git clone $IMMORTAL_REPO immortalwrt
+          cd immortalwrt
+          git checkout $IMMORTAL_BRANCH
+
+      # 执行脚本1：拉取第三方插件
+      - name: Custom script 1 (Add plugins)
+        run: cd immortalwrt && bash ../diy-part1.sh
+
+      # 替换软件源、更新feeds
+      - name: Update feeds
+        run: |
+          cd immortalwrt
+          rm -f feeds.conf.default
+          cp ../feeds.conf.default feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # 执行脚本2：修改后台IP、主题、主机名
+      - name: Custom script 2 (System config)
+        run: cd immortalwrt && bash ../diy-part2.sh
+
+      # 导入本地提前做好的编译配置
+      - name: Import .config
+        run: |
+          cd immortalwrt
+          cp ../config/.config .config
+          make defconfig
+
+      # 预下载所有源码包，避免编译中途下载超时
+      - name: Download all source packages
+        run: cd immortalwrt && make download -j$(nproc)
+
+      # 正式编译固件
+      - name: Build firmware
+        run: cd immortalwrt && make -j$(nproc)
+
+      # 打包固件
+      - name: Package firmware
+        run: |
+          cd immortalwrt/bin/targets/*/*
+          tar -zcvf ImmortalWrt-${{ github.sha }}.tar.gz ./*
+
+      # 自动上传固件到仓库 Releases
+      - name: Upload firmware to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: immortalwrt/bin/targets/*/*/*.tar.gz
+          tag_name: auto-build-${{ github.sha }}
+          name: ImmortalWrt 自动编译固件 ${{ github.sha }}
+          body: 编译提交哈希：${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
